@@ -1,188 +1,285 @@
-// server.js — Express 4 + IA (OpenAI) + CORS whitelist + PDF em buffer + tema/keywords/temperature
+import { useEffect, useMemo, useState } from 'react';
 
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
-const PDFDocument = require('pdfkit');
+export default function App() {
+  const [language, setLanguage] = useState('pt');
+  const [length, setLength] = useState(300);
+  const [tone, setTone] = useState('casual');
+  const [format, setFormat] = useState('txt');
+  const [fileName, setFileName] = useState('arquivo.txt');
+  const [status, setStatus] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [fileUrl, setFileUrl] = useState(null);
 
-const app = express();
-const PORT = process.env.PORT || 8080;
+  const [topic, setTopic] = useState('');
+  const [keywords, setKeywords] = useState('');
+  const [temperature, setTemperature] = useState(0.8);
+  const [aiOn, setAiOn] = useState(null);
 
-// ====== CORS (preflight + whitelist sem lançar erro) ======
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  // preview
+  const [previewType, setPreviewType] = useState(null); // 'pdf' | 'txt' | null
+  const [previewText, setPreviewText] = useState('');   // conteúdo do .txt para mostrar
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (!allowed.length) {
-    res.setHeader('Access-Control-Allow-Origin', '*'); // dev
-  } else if (origin && allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+  const apiBase = useMemo(() => (import.meta.env.VITE_API_URL || '').replace(/\/+$/,''), []);
+  const hasBackend = !!apiBase;
+
+  useEffect(() => {
+    if (!apiBase) { setAiOn(false); return; }
+    fetch(`${apiBase}/health`).then(r => r.json())
+      .then(j => setAiOn(!!j.ai))
+      .catch(() => setAiOn(false));
+  }, [apiBase]);
+
+  function sanitizeName(name, fmt) {
+    const def = fmt === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt';
+    const s = String(name || def).replace(/[^\w.\-]/g, '_');
+    return s || def;
   }
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (!allowed.length) return cb(null, true);
-    return cb(null, allowed.includes(origin)); // true/false (sem throw)
-  },
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  optionsSuccessStatus: 204,
-}));
-
-// ====== middlewares comuns ======
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(express.json({ limit: '1mb' }));
-app.use(morgan('tiny'));
-app.use(rateLimit({ windowMs: 60_000, max: 60 }));
-
-// ====== util ======
-function gerarTextoLocal({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '' }) {
-  const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
-  const base = tone === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
-  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean);
-  const assunto = topic ? ` Tema: ${topic}.` : '';
-  const kws = kw.length ? ` Palavras-chave: ${kw.slice(0,8).join(', ')}.` : '';
-  const alvo = Math.max(30, Math.min(5000, Number(length) || 200));
-  const bloco = `${base} ${lingua}.${assunto}${kws} `;
-  return bloco.repeat(Math.ceil(alvo / Math.max(20, bloco.length))).slice(0, alvo);
-}
-
-// ≈ conversão letras→tokens (aprox.)
-const lettersToTokens = (n) => Math.max(50, Math.ceil(Number(n || 200) / 4));
-
-// ====== IA (OpenAI) ======
-const useAI = !!process.env.OPENAI_API_KEY;
-let openaiClient = null;
-if (useAI) {
-  try {
-    const OpenAI = require('openai');
-    openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    console.log('IA: OpenAI habilitada');
-  } catch (e) {
-    console.warn('IA: pacote openai indisponível, usando fallback local.', e?.message);
+  function gerarTextoLocal(lang, len, t, top = '', kw = '') {
+    const lingua = lang === 'pt' ? 'Português' : lang === 'en' ? 'Inglês' : 'Espanhol';
+    const cab = t === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
+    const assunto = top ? ` Tema: ${top}.` : '';
+    const kws = kw ? ` Palavras-chave: ${kw}.` : '';
+    const base = `${cab} (${lingua}).${assunto}${kws} `;
+    let out = '';
+    while (out.length < len) out += base;
+    return out.slice(0, len);
   }
-}
 
-async function gerarTextoIA({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '', temperature = 0.8 }) {
-  if (!openaiClient) throw new Error('IA indisponível');
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  async function handleGenerate(e) {
+    e.preventDefault();
+    setLoading(true);
+    setStatus('Gerando…');
+    if (fileUrl) { URL.revokeObjectURL(fileUrl); setFileUrl(null); }
+    setPreviewText('');
+    setPreviewType(null);
 
-  const langName = language === 'en' ? 'English' : language === 'es' ? 'Spanish' : 'Portuguese';
-  const toneName = tone === 'professional' ? 'professional' : 'casual';
-  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean).slice(0,8);
-  const max_tokens = lettersToTokens(length) + 60;
-  const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
+    const body = JSON.stringify({
+      language, length, tone, format,
+      filename: sanitizeName(fileName, format),
+      topic, keywords, temperature
+    });
 
-  const prompt = `
-Write a ${toneName} plain-text piece in ${langName}.
-Target length: around ${length} characters (do not exceed much).
-Topic: ${topic || 'generic demonstration'}.
-Keywords: ${kw.length ? kw.join(', ') : 'none'}.
-No markdown, no lists unless necessary. Keep it coherent and natural.
-`.trim();
+    const withTimeout = (promise, ms = 20000) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), ms);
+      return Promise.race([
+        promise(ctrl.signal),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('Timeout')), ms + 50))
+      ]).finally(() => clearTimeout(timer));
+    };
 
-  const resp = await openaiClient.chat.completions.create({
-    model,
-    messages: [
-      { role: 'system', content: 'You are a writing assistant that follows size, language, and tone constraints strictly. Return only plain text.' },
-      { role: 'user', content: prompt }
-    ],
-    max_tokens,
-    temperature: temp,
-  });
-
-  const content = resp?.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error('Resposta vazia da IA');
-  return content.length > length ? content.slice(0, length) : content;
-}
-
-// ====== rotas ======
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'filegen-backend',
-    endpoints: ['GET /health', 'POST /api/generate'],
-    ai: useAI ? 'openai' : 'disabled'
-  });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), ai: useAI });
-});
-
-app.post('/api/generate', async (req, res, next) => {
-  try {
-    const {
-      language = 'pt',
-      length = 200,
-      tone = 'casual',
-      format = 'txt',
-      filename,
-      topic = '',
-      keywords = '',
-      temperature = 0.8,
-    } = req.body || {};
-
-    // texto: IA (se habilitada) -> fallback local
-    let text;
     try {
-      text = useAI
-        ? await gerarTextoIA({ language, length, tone, topic, keywords, temperature })
-        : gerarTextoLocal({ language, length, tone, topic, keywords });
+      if (!hasBackend) {
+        // demo local
+        if (format === 'txt') {
+          const text = gerarTextoLocal(language, length, tone, topic, keywords);
+          const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          setFileUrl(url);
+          setPreviewText(text);
+          setPreviewType('txt');
+          setStatus('TXT local gerado (demo, sem backend).');
+        } else {
+          setStatus('Pré-visualização PDF local indisponível sem backend.');
+        }
+        return;
+      }
+
+      const resp = await withTimeout(signal => fetch(`${apiBase}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body, signal
+      }));
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} em /api/generate: ${txt.slice(0,200)}`);
+      }
+
+      // Para TXT, capturamos também o texto pro preview
+      let textForPreview = '';
+      if (format === 'txt') {
+        try { textForPreview = await resp.clone().text(); } catch {}
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      setFileUrl(url);
+      setPreviewType(format === 'pdf' ? 'pdf' : 'txt');
+      setPreviewText(textForPreview || '');
+      setStatus('Pronto! Visualize ou baixe o arquivo.');
     } catch (err) {
-      console.warn('IA falhou, usando fallback local:', err?.message || err);
-      text = gerarTextoLocal({ language, length, tone, topic, keywords });
+      const msg = String(err?.message || err);
+      if (msg.includes('Failed to fetch') || msg.includes('TypeError')) {
+        setStatus('Falha de rede/CORS. Confira ALLOWED_ORIGINS no backend e a URL em VITE_API_URL.');
+      } else {
+        setStatus(msg);
+      }
+      console.error('GERAR ERRO:', err);
+    } finally {
+      setLoading(false);
     }
-
-    const safeName = String(filename || (format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt')).replace(/[^\w.\-]/g, '_');
-
-    if (format === 'pdf') {
-      // PDF em memória
-      const chunks = [];
-      const doc = new PDFDocument({ margin: 40 });
-      doc.on('data', c => chunks.push(c));
-      doc.on('error', err => next(err));
-      doc.on('end', () => {
-        const pdfBuffer = Buffer.concat(chunks);
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.pdf'}"`);
-        return res.status(200).send(pdfBuffer);
-      });
-      doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
-      doc.moveDown();
-      doc.fontSize(12).text(text, { align: 'left' });
-      doc.end();
-      return;
-    }
-
-    // TXT
-    const buffer = Buffer.from(text, 'utf-8');
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.txt'}"`);
-    return res.status(200).send(buffer);
-  } catch (err) {
-    next(err);
   }
-});
 
-// handler global
-app.use((err, _req, res, _next) => {
-  console.error('GLOBAL ERROR:', err);
-  if (!res.headersSent) res.status(500).json({ error: 'Erro interno', detail: String(err?.message || err) });
-});
+  function handleDownload() {
+    if (!fileUrl) return;
+    const a = document.createElement('a');
+    a.href = fileUrl;
+    a.download = sanitizeName(fileName, format);
+    a.click();
+  }
 
-// start
-app.listen(PORT, () => {
-  console.log(`API ouvindo em http://localhost:${PORT}`);
-});
+  function handlePreview() {
+    if (!fileUrl) return;
+    window.open(fileUrl, '_blank', 'noopener,noreferrer');
+  }
+
+  function handleDelete() {
+    if (fileUrl) URL.revokeObjectURL(fileUrl);
+    setFileUrl(null);
+    setPreviewText('');
+    setPreviewType(null);
+    setStatus('Arquivo descartado no navegador.');
+  }
+
+  return (
+    <div className="page">
+      <header className="header">
+        <h1>Gerador de Arquivos</h1>
+        <span className="api-pill">
+          API: {apiBase || '(sem VITE_API_URL)'} • IA: {aiOn === null ? '...' : aiOn ? 'ON' : 'OFF'}
+        </span>
+      </header>
+
+      {!hasBackend && (
+        <div className="banner warn">Modo demo (sem backend): apenas TXT local.</div>
+      )}
+
+      <main className="grid">
+        <section className="card">
+          <h2 className="card-title">Configurações</h2>
+          <form onSubmit={handleGenerate} className="form">
+            <label className="field">
+              <span>Idioma</span>
+              <select value={language} onChange={e => setLanguage(e.target.value)}>
+                <option value="pt">Português</option>
+                <option value="en">Inglês</option>
+                <option value="es">Espanhol</option>
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Quantidade de letras (aprox.)</span>
+              <div className="dual">
+                <input type="range" min={30} max={5000} value={length}
+                  onChange={e => setLength(Number(e.target.value))} />
+                <input type="number" min={30} max={5000} value={length}
+                  onChange={e => setLength(Number(e.target.value))} />
+              </div>
+              <small>{length} caracteres</small>
+            </label>
+
+            <label className="field">
+              <span>Tom/Linguagem</span>
+              <div className="segmented">
+                <button type="button"
+                  className={tone === 'casual' ? 'seg on' : 'seg'}
+                  onClick={() => setTone('casual')}>Casual</button>
+                <button type="button"
+                  className={tone === 'professional' ? 'seg on' : 'seg'}
+                  onClick={() => setTone('professional')}>Profissional</button>
+              </div>
+            </label>
+
+            <label className="field">
+              <span>Tema/Assunto</span>
+              <input type="text" value={topic} onChange={e => setTopic(e.target.value)}
+                placeholder="ex.: apresentação de produto, marketing..." />
+            </label>
+
+            <label className="field">
+              <span>Palavras-chave (separe por vírgulas)</span>
+              <input type="text" value={keywords} onChange={e => setKeywords(e.target.value)}
+                placeholder="ex.: tecnologia, eficiência, design" />
+            </label>
+
+            <label className="field">
+              <span>Criatividade (temperature)</span>
+              <div className="dual">
+                <input type="range" min={0} max={1} step={0.1} value={temperature}
+                  onChange={e => setTemperature(Number(e.target.value))} />
+                <input type="number" min={0} max={1} step={0.1} value={temperature}
+                  onChange={e => setTemperature(Number(e.target.value))} />
+              </div>
+              <small>0 = mais fiel, 1 = mais criativo</small>
+            </label>
+
+            <label className="field">
+              <span>Formato</span>
+              <select value={format} onChange={e => {
+                const fmt = e.target.value;
+                setFormat(fmt);
+                setFileName(sanitizeName(fileName, fmt));
+              }}>
+                <option value="txt">TXT</option>
+                <option value="pdf">PDF</option>
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Nome do arquivo</span>
+              <input
+                type="text"
+                value={fileName}
+                onChange={e => setFileName(sanitizeName(e.target.value, format))}
+                placeholder={format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt'}
+              />
+            </label>
+
+            <button className="btn primary" type="submit" disabled={loading}>
+              {loading ? 'Gerando…' : 'Gerar'}
+            </button>
+
+            <p className="status">{status}</p>
+          </form>
+        </section>
+
+        <section className="card">
+          <h2 className="card-title">Resultado</h2>
+
+          {!fileUrl ? (
+            <p className="muted">Nada gerado ainda.</p>
+          ) : (
+            <>
+              <div className="actions">
+                <button className="btn" onClick={handlePreview}>Visualizar</button>
+                <button className="btn" onClick={handleDownload}>Baixar</button>
+                <button className="btn danger" onClick={handleDelete}>Apagar</button>
+              </div>
+
+              <div className="preview">
+                <div className="preview-header">Pré-visualização</div>
+                {previewType === 'pdf' ? (
+                  <iframe className="preview-frame" src={fileUrl} title="Pré-visualização PDF" />
+                ) : (
+                  <pre className="preview-text">{previewText || '...'}</pre>
+                )}
+              </div>
+            </>
+          )}
+
+          <ul className="tips">
+            <li>Se “Falha de rede/CORS”, verifique <code>ALLOWED_ORIGINS</code> no backend e <code>VITE_API_URL</code> no front (sem “/” no fim).</li>
+            <li>Abra o app em aba externa (não no webview).</li>
+          </ul>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <small>Feito com React + Vite</small>
+      </footer>
+    </div>
+  );
+}
+
 
