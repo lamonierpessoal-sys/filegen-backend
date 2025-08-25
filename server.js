@@ -1,4 +1,4 @@
-// server.js — Express 4 + IA (OpenAI) + CORS whitelist + PDF em buffer
+// server.js — Express 4 + IA (OpenAI) + CORS whitelist + PDF em buffer + tema/keywords/temperature
 
 const express = require('express');
 const cors = require('cors');
@@ -14,7 +14,6 @@ const PORT = process.env.PORT || 8080;
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Preflight universal
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!allowed.length) {
@@ -35,8 +34,8 @@ app.use(cors({
     if (!allowed.length) return cb(null, true);
     return cb(null, allowed.includes(origin)); // true/false (sem throw)
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
   optionsSuccessStatus: 204,
 }));
 
@@ -47,12 +46,15 @@ app.use(morgan('tiny'));
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
 // ====== util ======
-function gerarTextoLocal({ language = 'pt', length = 200, tone = 'casual' }) {
+function gerarTextoLocal({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
   const base = tone === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
+  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean);
+  const assunto = topic ? ` Tema: ${topic}.` : '';
+  const kws = kw.length ? ` Palavras-chave: ${kw.slice(0,8).join(', ')}.` : '';
   const alvo = Math.max(30, Math.min(5000, Number(length) || 200));
-  const texto = (base + ' ' + lingua + '. ').repeat(Math.ceil(alvo / 30));
-  return texto.slice(0, alvo);
+  const bloco = `${base} ${lingua}.${assunto}${kws} `;
+  return bloco.repeat(Math.ceil(alvo / Math.max(20, bloco.length))).slice(0, alvo);
 }
 
 // ≈ conversão letras→tokens (aprox.)
@@ -67,40 +69,40 @@ if (useAI) {
     openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     console.log('IA: OpenAI habilitada');
   } catch (e) {
-    console.warn('IA: pacote openai não disponível, usando fallback local.', e?.message);
+    console.warn('IA: pacote openai indisponível, usando fallback local.', e?.message);
   }
 }
 
-async function gerarTextoIA({ language = 'pt', length = 200, tone = 'casual' }) {
+async function gerarTextoIA({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '', temperature = 0.8 }) {
   if (!openaiClient) throw new Error('IA indisponível');
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-  const langName = language === 'en' ? 'English'
-                  : language === 'es' ? 'Spanish'
-                  : 'Portuguese';
+  const langName = language === 'en' ? 'English' : language === 'es' ? 'Spanish' : 'Portuguese';
   const toneName = tone === 'professional' ? 'professional' : 'casual';
+  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean).slice(0,8);
+  const max_tokens = lettersToTokens(length) + 60;
+  const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
 
-  const max_tokens = lettersToTokens(length) + 40; // folga
   const prompt = `
-Write a ${toneName} text in ${langName}.
-Hard limit: ~${length} characters (do not exceed much).
-Topic: a generic placeholder content suitable for a file generator demo.
-Keep it plain text (no markdown).
-`;
+Write a ${toneName} plain-text piece in ${langName}.
+Target length: around ${length} characters (do not exceed much).
+Topic: ${topic || 'generic demonstration'}.
+Keywords: ${kw.length ? kw.join(', ') : 'none'}.
+No markdown, no lists unless necessary. Keep it coherent and natural.
+`.trim();
 
   const resp = await openaiClient.chat.completions.create({
     model,
     messages: [
-      { role: 'system', content: 'You are a writing assistant that follows size/tone constraints strictly.' },
-      { role: 'user', content: prompt.trim() }
+      { role: 'system', content: 'You are a writing assistant that follows size, language, and tone constraints strictly. Return only plain text.' },
+      { role: 'user', content: prompt }
     ],
     max_tokens,
-    temperature: 0.8,
+    temperature: temp,
   });
 
   const content = resp?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error('Resposta vazia da IA');
-  // corta se passou muito do alvo em letras
   return content.length > length ? content.slice(0, length) : content;
 }
 
@@ -120,20 +122,32 @@ app.get('/health', (_req, res) => {
 
 app.post('/api/generate', async (req, res, next) => {
   try {
-    const { language = 'pt', length = 200, tone = 'casual', format = 'txt', filename } = req.body || {};
-    const safeName = String(filename || (format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt')).replace(/[^\w.\-]/g, '_');
+    const {
+      language = 'pt',
+      length = 200,
+      tone = 'casual',
+      format = 'txt',
+      filename,
+      topic = '',
+      keywords = '',
+      temperature = 0.8,
+    } = req.body || {};
 
     // texto: IA (se habilitada) -> fallback local
     let text;
     try {
-      text = useAI ? await gerarTextoIA({ language, length, tone }) : gerarTextoLocal({ language, length, tone });
+      text = useAI
+        ? await gerarTextoIA({ language, length, tone, topic, keywords, temperature })
+        : gerarTextoLocal({ language, length, tone, topic, keywords });
     } catch (err) {
       console.warn('IA falhou, usando fallback local:', err?.message || err);
-      text = gerarTextoLocal({ language, length, tone });
+      text = gerarTextoLocal({ language, length, tone, topic, keywords });
     }
 
+    const safeName = String(filename || (format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt')).replace(/[^\w.\-]/g, '_');
+
     if (format === 'pdf') {
-      // Gera PDF em memória (buffer)
+      // PDF em memória
       const chunks = [];
       const doc = new PDFDocument({ margin: 40 });
       doc.on('data', c => chunks.push(c));
