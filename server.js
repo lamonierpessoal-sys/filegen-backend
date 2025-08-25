@@ -10,23 +10,39 @@ const PORT = process.env.PORT || 8080;
 
 // CORS: libera tudo (para DEV). Depois a gente restringe.
 app.use(cors());
-app.options('*', cors());
+const express = require('express');
+const cors = require('cors');
+const PDFDocument = require('pdfkit');
+const morgan = require('morgan');
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// 🔧 Preflight CORS universal (sem usar app.options('*'))
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // depois você restringe
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// CORS liberado em dev (não lança erro)
+app.use(cors());
 
 // Logs + JSON
 app.use(morgan('tiny'));
 app.use(express.json({ limit: '1mb' }));
 
-// Rota raiz só para não ver 404 no Render
+// (o resto igual…)
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'filegen-backend', endpoints: ['GET /health', 'POST /api/generate'] });
 });
 
-// Health
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
-// Util: gera texto de tamanho aproximado
 function gerarTexto({ language = 'pt', length = 200, tone = 'casual' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
   const base = tone === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
@@ -35,7 +51,6 @@ function gerarTexto({ language = 'pt', length = 200, tone = 'casual' }) {
   return texto.slice(0, alvo);
 }
 
-// Geração (TXT/PDF) — PDF em buffer (sem stream direto)
 app.post('/api/generate', (req, res, next) => {
   try {
     const { language = 'pt', length = 200, tone = 'casual', format = 'txt', filename } = req.body || {};
@@ -55,10 +70,8 @@ app.post('/api/generate', (req, res, next) => {
       });
       doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
       doc.moveDown();
-      doc.fontSize(12).text(text, { align: 'left' });
-      doc.end();
-      return; // aguardar 'end'
-    }
+      doc
+
 
     // TXT
     const buffer = Buffer.from(text, 'utf-8');
