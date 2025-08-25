@@ -155,7 +155,7 @@ app.post('/api/generate', async (req, res, next) => {
       doc.on('end', () => {
         const pdfBuffer = Buffer.concat(chunks);
         res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.pdf'}"`);
+        res.setHeader('Content-Disposition', `inline; filename="${safeName || 'arquivo.pdf'}"`);
         return res.status(200).send(pdfBuffer);
       });
       doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
