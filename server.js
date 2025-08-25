@@ -6,6 +6,13 @@ const morgan = require('morgan');
 const PDFDocument = require('pdfkit');
 
 const app = express();
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // depois restringimos
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 const PORT = process.env.PORT || 8080;
 
 // --- middlewares ---
