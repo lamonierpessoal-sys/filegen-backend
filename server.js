@@ -1,41 +1,32 @@
+// server.js — versão mínima e estável (dev)
+
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
 const PDFDocument = require('pdfkit');
+const morgan = require('morgan');
 
 const app = express();
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // depois restringimos
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
 const PORT = process.env.PORT || 8080;
 
-// --- middlewares ---
-app.use(helmet());
-app.use(express.json({ limit: '1mb' }));
+// CORS: libera tudo (para DEV). Depois a gente restringe.
+app.use(cors());
+app.options('*', cors());
+
+// Logs + JSON
 app.use(morgan('tiny'));
+app.use(express.json({ limit: '1mb' }));
 
-// CORS (em produção, preencha ALLOWED_ORIGINS com as URLs do seu Replit)
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+// Rota raiz só para não ver 404 no Render
+app.get('/', (_req, res) => {
+  res.json({ ok: true, service: 'filegen-backend', endpoints: ['GET /health', 'POST /api/generate'] });
+});
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (allowed.length === 0) return cb(null, true); // dev libera tudo
-    return allowed.includes(origin) ? cb(null, true) : cb(new Error('CORS: origem não permitida'));
-  }
-}));
+// Health
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
 
-app.use(rateLimit({ windowMs: 60 * 1000, max: 60 }));
-
+// Util: gera texto de tamanho aproximado
 function gerarTexto({ language = 'pt', length = 200, tone = 'casual' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
   const base = tone === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
@@ -44,35 +35,46 @@ function gerarTexto({ language = 'pt', length = 200, tone = 'casual' }) {
   return texto.slice(0, alvo);
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
-
-app.post('/api/generate', async (req, res) => {
+// Geração (TXT/PDF) — PDF em buffer (sem stream direto)
+app.post('/api/generate', (req, res, next) => {
   try {
-    const { language = 'pt', length = 200, tone = 'casual', format = 'txt' } = req.body || {};
+    const { language = 'pt', length = 200, tone = 'casual', format = 'txt', filename } = req.body || {};
     const text = gerarTexto({ language, length, tone });
+    const safeName = String(filename || (format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt')).replace(/[^\w.\-]/g, '_');
 
     if (format === 'pdf') {
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', 'attachment; filename="arquivo.pdf"');
+      const chunks = [];
       const doc = new PDFDocument({ margin: 40 });
-      doc.pipe(res);
+      doc.on('data', (c) => chunks.push(c));
+      doc.on('error', (err) => next(err));
+      doc.on('end', () => {
+        const pdfBuffer = Buffer.concat(chunks);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.pdf'}"`);
+        return res.status(200).send(pdfBuffer);
+      });
       doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
       doc.moveDown();
       doc.fontSize(12).text(text, { align: 'left' });
       doc.end();
-      return;
+      return; // aguardar 'end'
     }
 
+    // TXT
     const buffer = Buffer.from(text, 'utf-8');
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="arquivo.txt"');
-    res.send(buffer);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.txt'}"`);
+    return res.status(200).send(buffer);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Falha ao gerar arquivo' });
+    return next(err);
   }
+});
+
+// Handler global de erros
+app.use((err, _req, res, _next) => {
+  console.error('GLOBAL ERROR:', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'Erro interno', detail: String(err?.message || err) });
 });
 
 app.listen(PORT, () => {
