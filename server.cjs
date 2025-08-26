@@ -1,5 +1,4 @@
-
-// server.cjs — Express 4 + IA (OpenAI) + CORS whitelist + PDF em buffer
+// server.cjs — Express + IA (OpenAI) + CORS whitelist + PDF/MD/CSV/TXT
 
 const express = require('express');
 const cors = require('cors');
@@ -11,11 +10,11 @@ const PDFDocument = require('pdfkit');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ====== CORS (preflight + whitelist sem lançar erro) ======
+// ====== CORS ======
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Preflight universal
+// Preflight + permissivo em dev
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!allowed.length) {
@@ -34,35 +33,54 @@ app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     if (!allowed.length) return cb(null, true);
-    return cb(null, allowed.includes(origin)); // true/false (sem throw)
+    return cb(null, allowed.includes(origin));
   },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   optionsSuccessStatus: 204,
 }));
 
-// ====== middlewares comuns ======
+// ====== common middlewares ======
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-// ====== util ======
-function gerarTextoLocal({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '' }) {
+// ====== helpers ======
+function lettersToTokens(n) { return Math.max(50, Math.ceil(Number(n || 200) / 4)); }
+
+function gerarLocal({ language='pt', length=200, tone='casual', contentType='plain', topic='', keywords='' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
-  const base = tone === 'professional' ? 'Conteúdo profissional' : 'Conteúdo casual';
-  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean);
-  const assunto = topic ? ` Tema: ${topic}.` : '';
-  const kws = kw.length ? ` Palavras-chave: ${kw.slice(0,8).join(', ')}.` : '';
   const alvo = Math.max(30, Math.min(5000, Number(length) || 200));
-  const bloco = `${base} ${lingua}.${assunto}${kws} `;
-  return bloco.repeat(Math.ceil(alvo / Math.max(20, bloco.length))).slice(0, alvo);
+  const assunto = topic ? `Tema: ${topic}. ` : '';
+  const kws = keywords ? `Palavras-chave: ${keywords}. ` : '';
+  let out = '';
+
+  if (contentType === 'blog') {
+    out = `# Título do Post (${lingua})\n\n## Introdução\n${assunto}${kws}Conteúdo ${tone}.\n\n## Seção\nTexto.\n\n## Conclusão\nEncerramento. `;
+  } else if (contentType === 'resumo') {
+    out = `Resumo (${lingua}) — ${assunto}${kws}Síntese objetiva em tom ${tone}. `;
+  } else if (contentType === 'email') {
+    out = `Assunto: ${topic || 'Assunto'}\n\nPrezados,\n\n${kws}Mensagem em tom ${tone}.\n\nAtenciosamente,\nSeu Nome`;
+  } else if (contentType === 'social') {
+    out = `Post (${lingua}) — ${assunto}${kws}Mensagem curta em tom ${tone}. #hashtag `;
+  } else if (contentType === 'planilha') {
+    const rows = [
+      ['Titulo','Resumo','PalavrasChave'],
+      ['Item 1','Descrição breve 1', keywords || ''],
+      ['Item 2','Descrição breve 2', keywords || ''],
+      ['Item 3','Descrição breve 3', keywords || ''],
+    ];
+    return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+  } else {
+    out = `Texto (${lingua}). ${assunto}${kws}Conteúdo ${tone}. `;
+  }
+
+  while (out.length < alvo) out += 'Conteúdo adicional. ';
+  return out.slice(0, alvo);
 }
 
-// ≈ conversão letras→tokens (aprox.)
-const lettersToTokens = (n) => Math.max(50, Math.ceil(Number(n || 200) / 4));
-
-// ====== IA (OpenAI) ======
+// ====== IA (OpenAI) opcional ======
 const useAI = !!process.env.OPENAI_API_KEY;
 let openaiClient = null;
 if (useAI) {
@@ -75,29 +93,66 @@ if (useAI) {
   }
 }
 
-async function gerarTextoIA({ language = 'pt', length = 200, tone = 'casual', topic = '', keywords = '', temperature = 0.8 }) {
+async function gerarIA({ language='pt', length=200, tone='casual', contentType='plain', topic='', keywords='', temperature=0.8, format='txt' }) {
   if (!openaiClient) throw new Error('IA indisponível');
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
   const langName = language === 'en' ? 'English' : language === 'es' ? 'Spanish' : 'Portuguese';
   const toneName = tone === 'professional' ? 'professional' : 'casual';
-  const kw = String(keywords || '').split(',').map(s=>s.trim()).filter(Boolean).slice(0,8);
-  const max_tokens = lettersToTokens(length) + 60;
+  const max_tokens = lettersToTokens(length) + 80;
   const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
 
-  const prompt = `
-Write a ${toneName} plain-text piece in ${langName}.
-Target length: around ${length} characters (do not exceed much).
-Topic: ${topic || 'generic demonstration'}.
-Keywords: ${kw.length ? kw.join(', ') : 'none'}.
-No markdown. Keep it coherent and natural.
+  // instruções por tipo/saída
+  let userContent = '';
+  if (contentType === 'planilha' || format === 'csv') {
+    userContent = `
+Create a CSV with header: "Titulo,Resumo,PalavrasChave".
+Language: ${langName}. Tone: ${toneName}.
+Topic: ${topic || 'generic'}.
+Keywords: ${keywords || 'none'}.
+Rows: 3–6 rows, concise fields. Do not add commentary; return only CSV.
+Target total length around ${length} chars (approx).
 `.trim();
+  } else if (format === 'md' || contentType === 'blog') {
+    userContent = `
+Write a ${toneName} Markdown article in ${langName}.
+Topic: ${topic || 'generic'}.
+Keywords: ${keywords || 'none'}.
+Use an H1 title, 2–3 H2 sections, short paragraphs and (optionally) a bullet list.
+Target around ${length} characters (do not exceed too much). Return only Markdown.
+`.trim();
+  } else if (contentType === 'email') {
+    userContent = `
+Write a ${toneName} professional email in ${langName}.
+Subject: ${topic || 'Subject'}.
+Keywords/context: ${keywords || 'none'}.
+Target around ${length} characters. Return plain text email body.
+`.trim();
+  } else if (contentType === 'resumo') {
+    userContent = `
+Write a concise summary in ${langName}, ${toneName} tone.
+Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
+Target around ${length} characters. Return plain text only.
+`.trim();
+  } else if (contentType === 'social') {
+    userContent = `
+Write a short social media post in ${langName}, ${toneName} tone.
+Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
+Max ${Math.max(120, Math.min(500, length))} characters. Return plain text.
+`.trim();
+  } else {
+    userContent = `
+Write a ${toneName} plain text in ${langName}.
+Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
+Target around ${length} characters. Return plain text only.
+`.trim();
+  }
 
   const resp = await openaiClient.chat.completions.create({
     model,
     messages: [
-      { role: 'system', content: 'You are a writing assistant that follows size, language, and tone constraints strictly. Return only plain text.' },
-      { role: 'user', content: prompt }
+      { role: 'system', content: 'You are a writing assistant. Return only the requested format (plain text, Markdown, or CSV).' },
+      { role: 'user', content: userContent }
     ],
     max_tokens,
     temperature: temp,
@@ -105,48 +160,40 @@ No markdown. Keep it coherent and natural.
 
   const content = resp?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error('Resposta vazia da IA');
-  return content.length > length ? content.slice(0, length) : content;
+  // cortar um pouco se passar muito
+  return content.length > length * 2 ? content.slice(0, length * 2) : content;
 }
 
 // ====== rotas ======
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'filegen-backend',
-    endpoints: ['GET /health', 'POST /api/generate'],
-    ai: useAI ? 'openai' : 'disabled'
-  });
-});
-
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), ai: useAI });
+  res.json({ ok: true, uptime: process.uptime(), ai: !!openaiClient });
 });
 
 app.post('/api/generate', async (req, res, next) => {
   try {
     const {
-      language = 'pt',
-      length = 200,
-      tone = 'casual',
-      format = 'txt',
+      language='pt', length=200, tone='casual',
+      contentType='plain',
+      format='txt',
       filename,
-      topic = '',
-      keywords = '',
-      temperature = 0.8,
+      topic='', keywords='', temperature=0.8,
     } = req.body || {};
 
-    let text;
+    // gerar conteúdo
+    let content;
     try {
-      text = useAI
-        ? await gerarTextoIA({ language, length, tone, topic, keywords, temperature })
-        : gerarTextoLocal({ language, length, tone, topic, keywords });
-    } catch (err) {
-      console.warn('IA falhou, usando fallback local:', err?.message || err);
-      text = gerarTextoLocal({ language, length, tone, topic, keywords });
+      content = openaiClient
+        ? await gerarIA({ language, length, tone, contentType, topic, keywords, temperature, format })
+        : gerarLocal({ language, length, tone, contentType, topic, keywords });
+    } catch (e) {
+      console.warn('IA falhou, usando local:', e?.message);
+      content = gerarLocal({ language, length, tone, contentType, topic, keywords });
     }
 
-    const safeName = String(filename || (format === 'pdf' ? 'arquivo.pdf' : 'arquivo.txt')).replace(/[^\w.\-]/g, '_');
+    // nome seguro
+    const safeName = String(filename || 'arquivo.txt').replace(/[^\w.\-]/g, '_');
 
+    // responder por formato
     if (format === 'pdf') {
       const chunks = [];
       const doc = new PDFDocument({ margin: 40 });
@@ -158,14 +205,33 @@ app.post('/api/generate', async (req, res, next) => {
         res.setHeader('Content-Disposition', `inline; filename="${safeName || 'arquivo.pdf'}"`);
         return res.status(200).send(pdfBuffer);
       });
+
+      // título + corpo (se vier markdown/csv, vai como texto contínuo)
       doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
       doc.moveDown();
-      doc.fontSize(12).text(text, { align: 'left' });
+      doc.fontSize(12).text(content, { align: 'left' });
       doc.end();
       return;
     }
 
-    const buffer = Buffer.from(text, 'utf-8');
+    // MD
+    if (format === 'md') {
+      const buf = Buffer.from(content, 'utf-8');
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.md'}"`);
+      return res.status(200).send(buf);
+    }
+
+    // CSV
+    if (format === 'csv') {
+      const buf = Buffer.from(content, 'utf-8');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.csv'}"`);
+      return res.status(200).send(buf);
+    }
+
+    // TXT (default)
+    const buffer = Buffer.from(content, 'utf-8');
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.txt'}"`);
     return res.status(200).send(buffer);
@@ -174,14 +240,11 @@ app.post('/api/generate', async (req, res, next) => {
   }
 });
 
-// handler global
 app.use((err, _req, res, _next) => {
   console.error('GLOBAL ERROR:', err);
   if (!res.headersSent) res.status(500).json({ error: 'Erro interno', detail: String(err?.message || err) });
 });
 
-// start
 app.listen(PORT, () => {
   console.log(`API ouvindo em http://localhost:${PORT}`);
 });
-
