@@ -1,5 +1,4 @@
 // server.cjs — Express + IA (OpenAI opcional) + CORS whitelist + PDF/MD/CSV/TXT
-
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -29,7 +28,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Middleware cors com verificação de origin
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
@@ -50,6 +48,7 @@ app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 /* =================== helpers ==================== */
 function lettersToTokens(n) { return Math.max(50, Math.ceil(Number(n || 200) / 4)); }
 
+// Remove cercas ```csv/```md, normaliza e prepara CSV p/ Excel (BOM + CRLF)
 function extractCsvFromMarkdown(s) {
   if (!s) return '';
   const m = String(s).match(/```(?:csv)?\s*([\s\S]*?)```/i);
@@ -60,22 +59,47 @@ function toCsvUtf8Bom(s) {
   return Buffer.from('\uFEFF' + normalized, 'utf8');      // BOM UTF-8
 }
 
+// Anti-repetição e limpeza
+function normalizeSpaces(s) {
+  return String(s).replace(/[ \t]+/g, ' ').replace(/\s+\n/g, '\n').trim();
+}
+function dedupeSentences(s) {
+  const parts = String(s).match(/[^.!?…]+[.!?…]?/g) || [];
+  const seen = new Set(), out = [];
+  for (let seg of parts) {
+    const key = seg.replace(/\s+/g,' ').trim().toLowerCase();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(seg.trim());
+  }
+  return out.join(' ');
+}
+function postProcess(content, format) {
+  if (format === 'csv') return content; // CSV tratado em bloco próprio
+  let t = String(content || '');
+  // se vierem cercas de código por engano, remove
+  t = t.replace(/```[\s\S]*?```/g, m => m.includes('csv') ? m : '');
+  // colapsa palavras repetidas em sequência (ex.: "muito muito muito")
+  t = t.replace(/\b(\w+)(\s+\1){1,}\b/gi, '$1');
+  t = dedupeSentences(t);
+  t = normalizeSpaces(t);
+  return t;
+}
+
 function gerarLocal({ language='pt', length=200, tone='casual', contentType='plain', topic='', keywords='' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
   const alvo = Math.max(30, Math.min(5000, Number(length) || 200));
   const assunto = topic ? `Tema: ${topic}. ` : '';
   const kws = keywords ? `Palavras-chave: ${keywords}. ` : '';
-  let out = '';
+  const seeds = [
+    'Introdução objetiva ao tema.',
+    'Pontos principais apresentados com clareza.',
+    'Exemplos práticos para facilitar a compreensão.',
+    'Recomendações finais e próximos passos.'
+  ];
 
-  if (contentType === 'blog') {
-    out = `# Título do Post (${lingua})\n\n## Introdução\n${assunto}${kws}Conteúdo ${tone}.\n\n## Seção\nTexto.\n\n## Conclusão\nEncerramento. `;
-  } else if (contentType === 'resumo') {
-    out = `Resumo (${lingua}) — ${assunto}${kws}Síntese objetiva em tom ${tone}. `;
-  } else if (contentType === 'email') {
-    out = `Assunto: ${topic || 'Assunto'}\n\nPrezados,\n\n${kws}Mensagem em tom ${tone}.\n\nAtenciosamente,\nSeu Nome`;
-  } else if (contentType === 'social') {
-    out = `Post (${lingua}) — ${assunto}${kws}Mensagem curta em tom ${tone}. #hashtag `;
-  } else if (contentType === 'planilha') {
+  if (contentType === 'planilha') {
     const rows = [
       ['Titulo','Resumo','PalavrasChave'],
       ['Item 1','Descrição breve 1', keywords || ''],
@@ -83,12 +107,24 @@ function gerarLocal({ language='pt', length=200, tone='casual', contentType='pla
       ['Item 3','Descrição breve 3', keywords || ''],
     ];
     return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+  }
+
+  let out = '';
+  if (contentType === 'blog') {
+    out = `# Título do Post (${lingua})\n\n## Introdução\n${assunto}${kws}Conteúdo ${tone}.\n\n## Seção\nTexto.\n\n## Conclusão\nEncerramento. `;
+  } else if (contentType === 'resumo') {
+    out = `Resumo (${lingua}) — ${assunto}${kws}Síntese objetiva em tom ${tone}. `;
+  } else if (contentType === 'email') {
+    out = `Assunto: ${topic || 'Assunto'}\n\nPrezados,\n\n${kws}Mensagem em tom ${tone}.\n\nAtenciosamente,\nSeu Nome`;
+  } else if (contentType === 'social') {
+    out = `Post (${lingua}) — ${assunto}${kws}Mensagem curta em tom ${tone}. `;
   } else {
     out = `Texto (${lingua}). ${assunto}${kws}Conteúdo ${tone}. `;
   }
 
-  while (out.length < alvo) out += 'Conteúdo adicional. ';
-  return out.slice(0, alvo);
+  let i = 0;
+  while (out.length < alvo) out += ' ' + seeds[i++ % seeds.length];
+  return postProcess(out.slice(0, alvo), 'txt');
 }
 
 /* ================ IA (OpenAI) opcional ================ */
@@ -113,6 +149,7 @@ async function gerarIA({ language='pt', length=200, tone='casual', contentType='
   const max_tokens = lettersToTokens(length) + 80;
   const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
 
+  // instruções por tipo/saída, com foco em qualidade e não-repetição
   let userContent = '';
   if (contentType === 'planilha' || format === 'csv') {
     userContent = `
@@ -120,52 +157,69 @@ Create a CSV with header: "Titulo,Resumo,PalavrasChave".
 Language: ${langName}. Tone: ${toneName}.
 Topic: ${topic || 'generic'}.
 Keywords: ${keywords || 'none'}.
-Rows: 3–6 rows, concise fields. Do not add commentary; return only CSV (no code fences).
-Target total length around ${length} characters (approx).
+Rows: 3–6 rows, concise fields.
+Do not add any commentary or code fences — return ONLY raw CSV.
+Target total length ≈ ${length} characters.
 `.trim();
   } else if (format === 'md' || contentType === 'blog') {
     userContent = `
-Write a ${toneName} Markdown article in ${langName}.
-Topic: ${topic || 'generic'}.
-Keywords: ${keywords || 'none'}.
-Use an H1 title, 2–3 H2 sections, short paragraphs and (optionally) a bullet list.
-Target around ${length} characters. Return only Markdown (no code fences).
+Write a high-quality ${toneName} Markdown article in ${langName}.
+Topic: ${topic || 'generic'}. Keywords: ${keywords || 'none'}.
+- Use 1 H1 title and 2–3 H2 sections
+- Clear paragraphs, varied vocabulary, no boilerplate
+- No repeated sentences or headings
+- Return ONLY Markdown (no code fences)
+Target ≈ ${length} characters (±10%).
 `.trim();
   } else if (contentType === 'email') {
     userContent = `
-Write a ${toneName} professional email in ${langName}.
+Write a professional ${toneName} email in ${langName}.
 Subject: ${topic || 'Subject'}.
-Keywords/context: ${keywords || 'none'}.
-Target around ${length} characters. Return plain text email body only.
+Context/keywords: ${keywords || 'none'}.
+- Clear, polite, concise
+- No repeated sentences
+Return ONLY the email body as plain text.
+Target ≈ ${length} characters (±10%).
 `.trim();
   } else if (contentType === 'resumo') {
     userContent = `
 Write a concise summary in ${langName}, ${toneName} tone.
 Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Target around ${length} characters. Return plain text only.
+- No boilerplate, no repetition
+Return ONLY plain text.
+Target ≈ ${length} characters (±10%).
 `.trim();
   } else if (contentType === 'social') {
     userContent = `
 Write a short social media post in ${langName}, ${toneName} tone.
 Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Max ${Math.max(120, Math.min(500, length))} characters. Return plain text only.
+- Catchy, no hashtags unless meaningful
+- No repetition
+Max ${Math.max(120, Math.min(500, length))} characters.
+Return ONLY plain text.
 `.trim();
   } else {
     userContent = `
-Write a ${toneName} plain text in ${langName}.
+Write a high-quality ${toneName} plain text in ${langName}.
 Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Target around ${length} characters. Return plain text only.
+- Varied vocabulary, coherent structure
+- No boilerplate, no repeated sentences
+Return ONLY plain text.
+Target ≈ ${length} characters (±10%).
 `.trim();
   }
 
   const resp = await openaiClient.chat.completions.create({
     model,
     messages: [
-      { role: 'system', content: 'You are a writing assistant. Return only the requested format (plain text, Markdown, or CSV). Do not wrap the output in code fences.' },
+      { role: 'system', content: 'You are a careful writing assistant. Avoid repetition, avoid boilerplate, and follow the requested format strictly.' },
       { role: 'user', content: userContent }
     ],
     max_tokens,
     temperature: temp,
+    top_p: 0.9,
+    presence_penalty: 0.3,
+    frequency_penalty: 0.8,
   });
 
   const content = resp?.choices?.[0]?.message?.content?.trim();
@@ -199,6 +253,9 @@ app.post('/api/generate', async (req, res, next) => {
       content = gerarLocal({ language, length, tone, contentType, topic, keywords });
     }
 
+    // pós-processamento anti-repetição
+    content = postProcess(content, format);
+
     // nome seguro
     const safeName = String(filename || 'arquivo.txt').replace(/[^\w.\-]/g, '_');
 
@@ -224,13 +281,14 @@ app.post('/api/generate', async (req, res, next) => {
 
     // Markdown (.md)
     if (format === 'md') {
-      const buf = Buffer.from(String(content).replace(/```(?:markdown)?\s*|\s*```/gi, ''), 'utf-8');
+      const cleaned = String(content).replace(/```(?:markdown)?\s*|\s*```/gi, '');
+      const buf = Buffer.from(cleaned, 'utf-8');
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.md'}"`);
       return res.status(200).send(buf);
     }
 
-    // CSV (remove cercas ```csv e adiciona BOM + CRLF para Excel)
+    // CSV (remove cercas e adiciona BOM + CRLF)
     if (format === 'csv') {
       const cleaned = extractCsvFromMarkdown(content);
       const buf = toCsvUtf8Bom(cleaned);
