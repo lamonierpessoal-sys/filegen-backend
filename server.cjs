@@ -1,4 +1,4 @@
-// server.cjs — Express + IA (OpenAI) + CORS whitelist + PDF/MD/CSV/TXT
+// server.cjs — Express + IA (OpenAI opcional) + CORS whitelist + PDF/MD/CSV/TXT
 
 const express = require('express');
 const cors = require('cors');
@@ -10,11 +10,11 @@ const PDFDocument = require('pdfkit');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ====== CORS ======
+/* ===================== CORS ===================== */
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Preflight + permissivo em dev
+// Preflight + cabeçalhos básicos (permissivo em dev)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!allowed.length) {
@@ -29,6 +29,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// Middleware cors com verificação de origin
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
@@ -40,14 +41,24 @@ app.use(cors({
   optionsSuccessStatus: 204,
 }));
 
-// ====== common middlewares ======
+/* ================= middlewares ================== */
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-// ====== helpers ======
+/* =================== helpers ==================== */
 function lettersToTokens(n) { return Math.max(50, Math.ceil(Number(n || 200) / 4)); }
+
+function extractCsvFromMarkdown(s) {
+  if (!s) return '';
+  const m = String(s).match(/```(?:csv)?\s*([\s\S]*?)```/i);
+  return (m ? m[1] : s).trim();
+}
+function toCsvUtf8Bom(s) {
+  const normalized = String(s).replace(/\r?\n/g, '\r\n'); // CRLF p/ Excel
+  return Buffer.from('\uFEFF' + normalized, 'utf8');      // BOM UTF-8
+}
 
 function gerarLocal({ language='pt', length=200, tone='casual', contentType='plain', topic='', keywords='' }) {
   const lingua = { pt: 'em Português', en: 'in English', es: 'en Español' }[language] || 'em Português';
@@ -80,7 +91,7 @@ function gerarLocal({ language='pt', length=200, tone='casual', contentType='pla
   return out.slice(0, alvo);
 }
 
-// ====== IA (OpenAI) opcional ======
+/* ================ IA (OpenAI) opcional ================ */
 const useAI = !!process.env.OPENAI_API_KEY;
 let openaiClient = null;
 if (useAI) {
@@ -102,7 +113,6 @@ async function gerarIA({ language='pt', length=200, tone='casual', contentType='
   const max_tokens = lettersToTokens(length) + 80;
   const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
 
-  // instruções por tipo/saída
   let userContent = '';
   if (contentType === 'planilha' || format === 'csv') {
     userContent = `
@@ -110,8 +120,8 @@ Create a CSV with header: "Titulo,Resumo,PalavrasChave".
 Language: ${langName}. Tone: ${toneName}.
 Topic: ${topic || 'generic'}.
 Keywords: ${keywords || 'none'}.
-Rows: 3–6 rows, concise fields. Do not add commentary; return only CSV.
-Target total length around ${length} chars (approx).
+Rows: 3–6 rows, concise fields. Do not add commentary; return only CSV (no code fences).
+Target total length around ${length} characters (approx).
 `.trim();
   } else if (format === 'md' || contentType === 'blog') {
     userContent = `
@@ -119,14 +129,14 @@ Write a ${toneName} Markdown article in ${langName}.
 Topic: ${topic || 'generic'}.
 Keywords: ${keywords || 'none'}.
 Use an H1 title, 2–3 H2 sections, short paragraphs and (optionally) a bullet list.
-Target around ${length} characters (do not exceed too much). Return only Markdown.
+Target around ${length} characters. Return only Markdown (no code fences).
 `.trim();
   } else if (contentType === 'email') {
     userContent = `
 Write a ${toneName} professional email in ${langName}.
 Subject: ${topic || 'Subject'}.
 Keywords/context: ${keywords || 'none'}.
-Target around ${length} characters. Return plain text email body.
+Target around ${length} characters. Return plain text email body only.
 `.trim();
   } else if (contentType === 'resumo') {
     userContent = `
@@ -138,7 +148,7 @@ Target around ${length} characters. Return plain text only.
     userContent = `
 Write a short social media post in ${langName}, ${toneName} tone.
 Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Max ${Math.max(120, Math.min(500, length))} characters. Return plain text.
+Max ${Math.max(120, Math.min(500, length))} characters. Return plain text only.
 `.trim();
   } else {
     userContent = `
@@ -151,7 +161,7 @@ Target around ${length} characters. Return plain text only.
   const resp = await openaiClient.chat.completions.create({
     model,
     messages: [
-      { role: 'system', content: 'You are a writing assistant. Return only the requested format (plain text, Markdown, or CSV).' },
+      { role: 'system', content: 'You are a writing assistant. Return only the requested format (plain text, Markdown, or CSV). Do not wrap the output in code fences.' },
       { role: 'user', content: userContent }
     ],
     max_tokens,
@@ -160,11 +170,10 @@ Target around ${length} characters. Return plain text only.
 
   const content = resp?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error('Resposta vazia da IA');
-  // cortar um pouco se passar muito
   return content.length > length * 2 ? content.slice(0, length * 2) : content;
 }
 
-// ====== rotas ======
+/* ===================== rotas ===================== */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime(), ai: !!openaiClient });
 });
@@ -179,7 +188,7 @@ app.post('/api/generate', async (req, res, next) => {
       topic='', keywords='', temperature=0.8,
     } = req.body || {};
 
-    // gerar conteúdo
+    // gerar conteúdo (IA se disponível; fallback local)
     let content;
     try {
       content = openaiClient
@@ -193,7 +202,7 @@ app.post('/api/generate', async (req, res, next) => {
     // nome seguro
     const safeName = String(filename || 'arquivo.txt').replace(/[^\w.\-]/g, '_');
 
-    // responder por formato
+    // PDF (inline para pré-visualização no navegador)
     if (format === 'pdf') {
       const chunks = [];
       const doc = new PDFDocument({ margin: 40 });
@@ -206,7 +215,6 @@ app.post('/api/generate', async (req, res, next) => {
         return res.status(200).send(pdfBuffer);
       });
 
-      // título + corpo (se vier markdown/csv, vai como texto contínuo)
       doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
       doc.moveDown();
       doc.fontSize(12).text(content, { align: 'left' });
@@ -214,17 +222,18 @@ app.post('/api/generate', async (req, res, next) => {
       return;
     }
 
-    // MD
+    // Markdown (.md)
     if (format === 'md') {
-      const buf = Buffer.from(content, 'utf-8');
+      const buf = Buffer.from(String(content).replace(/```(?:markdown)?\s*|\s*```/gi, ''), 'utf-8');
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.md'}"`);
       return res.status(200).send(buf);
     }
 
-    // CSV
+    // CSV (remove cercas ```csv e adiciona BOM + CRLF para Excel)
     if (format === 'csv') {
-      const buf = Buffer.from(content, 'utf-8');
+      const cleaned = extractCsvFromMarkdown(content);
+      const buf = toCsvUtf8Bom(cleaned);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.csv'}"`);
       return res.status(200).send(buf);
