@@ -1,4 +1,4 @@
-// server.cjs — Express + IA (OpenAI opcional) + CORS whitelist + PDF/MD/CSV/TXT
+// server.cjs — Express + IA (OpenAI) + SEO avançado por parágrafo + PDF/MD/CSV/TXT
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -9,17 +9,14 @@ const PDFDocument = require('pdfkit');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ===================== CORS ===================== */
+/* =============== CORS =============== */
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (!allowed.length) {
-    res.setHeader('Access-Control-Allow-Origin', '*'); // dev
-  } else if (origin && allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
+  if (!allowed.length) res.setHeader('Access-Control-Allow-Origin', '*');
+  else if (origin && allowed.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -38,17 +35,15 @@ app.use(cors({
   optionsSuccessStatus: 204,
 }));
 
-/* ================= middlewares ================== */
+/* =============== middlewares =============== */
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-/* =================== helpers ==================== */
-// tokens ≈ palavras * 1.4 (aprox)
+/* =============== helpers =============== */
 function wordsToTokens(n) { return Math.max(64, Math.ceil(Number(n || 800) * 1.4)); }
 
-// CSV helpers
 function extractCsvFromMarkdown(s) {
   if (!s) return '';
   const m = String(s).match(/```(?:csv)?\s*([\s\S]*?)```/i);
@@ -59,7 +54,6 @@ function toCsvUtf8Bom(s) {
   return Buffer.from('\uFEFF' + normalized, 'utf8');
 }
 
-// anti-repetição
 function normalizeSpaces(s) {
   return String(s).replace(/[ \t]+/g, ' ').replace(/\s+\n/g, '\n').trim();
 }
@@ -84,46 +78,18 @@ function postProcess(content, format) {
   t = normalizeSpaces(t);
   return t;
 }
-
 function langName(code) {
-  const map = {
-    pt:'Portuguese', en:'English', es:'Spanish', fr:'French', de:'German',
-    it:'Italian', ja:'Japanese', ko:'Korean', zh:'Chinese', hi:'Hindi', ar:'Arabic'
-  };
+  const map = { pt:'Portuguese', en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', ja:'Japanese', ko:'Korean', zh:'Chinese', hi:'Hindi', ar:'Arabic' };
   return map[code] || 'Portuguese';
 }
-
-function gerarLocal({ language='pt', targetCountry='Brasil', words=800, style='informativo', tone='casual', pov='first', contentType='plain', topic='', keywords='' }) {
-  const lingua = langName(language);
-  const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
-  const header = `(${lingua}, target: ${targetCountry}, style: ${style}, tone: ${tone}, ${pv})`;
-  const assunto = topic ? ` Topic: ${topic}.` : '';
-  const kws = keywords ? ` Keywords: ${keywords}.` : '';
-
-  if (contentType === 'planilha') {
-    const rows = [
-      ['Titulo','Resumo','PalavrasChave'],
-      ['Item 1','Descrição breve 1', keywords || ''],
-      ['Item 2','Descrição breve 2', keywords || ''],
-      ['Item 3','Descrição breve 3', keywords || ''],
-    ];
-    return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
-  }
-
-  // gerar por PALAVRAS
-  const bag = [
-    `High-level overview ${header}.`, 'Key points explained clearly.',
-    'Practical examples to illustrate ideas.', 'Actionable recommendations.',
-    'Nuanced perspective to avoid repetition.', 'Smooth transitions between sections.'
-  ].join(' ');
-  const base = `${bag}${assunto}${kws} `;
-  const wordsArr = base.split(/\s+/);
-  const out = [];
-  while (out.length < words) out.push(wordsArr[out.length % wordsArr.length]);
-  return postProcess(out.slice(0, words).join(' '), 'txt');
+function ensureArrayFromCsv(s) {
+  return String(s || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
 }
 
-/* ================ IA (OpenAI) opcional ================ */
+/* =============== IA opcional =============== */
 const useAI = !!process.env.OPENAI_API_KEY;
 let openaiClient = null;
 if (useAI) {
@@ -136,83 +102,128 @@ if (useAI) {
   }
 }
 
-async function gerarIA({
-  language='pt', targetCountry='Brasil', words=800,
-  style='informativo', tone='casual', pov='first',
-  contentType='plain', topic='', keywords='', temperature=0.8, format='txt', aiModel
-}) {
-  if (!openaiClient) throw new Error('IA indisponível');
-  const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
-
-  const ln = langName(language);
-  const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
-  const max_tokens = wordsToTokens(words);
-  const temp = Math.max(0, Math.min(1, Number(temperature) || 0.8));
-
-  let userContent = '';
-  if (contentType === 'planilha' || format === 'csv') {
-    userContent = `
-Create a CSV with header: "Titulo,Resumo,PalavrasChave".
-Language: ${ln}. Country target: ${targetCountry}. Style: ${style}. Tone: ${tone}. POV: ${pv}.
-Topic: ${topic || 'generic'}. Keywords: ${keywords || 'none'}.
-Rows: 4–8, concise, no commentary. Return ONLY raw CSV (no code fences).
-`.trim();
-  } else if (format === 'md' || contentType === 'blog') {
-    userContent = `
-Write a high-quality Markdown article in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
-Topic: ${topic || 'generic'}. Keywords: ${keywords || 'none'}.
-- 1 H1 title, 2–4 H2 sections, short paragraphs, varied vocabulary
-- No boilerplate, no repeated sentences
-Return ONLY Markdown (no code fences). Target ≈ ${words} words (±10%).
-`.trim();
-  } else if (contentType === 'email') {
-    userContent = `
-Write a professional email in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
-Subject: ${topic || 'Subject'}. Keywords/context: ${keywords || 'none'}.
-No boilerplate and no repetition. Return ONLY the email body as plain text.
-Target ≈ ${words} words (±10%).
-`.trim();
-  } else if (contentType === 'resumo') {
-    userContent = `
-Write a concise summary in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
-Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-No boilerplate or repetition. Return plain text only. Target ≈ ${words} words (±10%).
-`.trim();
-  } else if (contentType === 'social') {
-    userContent = `
-Write a short social post in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
-Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Catchy, varied wording, no repetition. Max ${Math.max(50, Math.min(180, words))} words.
-Return plain text only.
-`.trim();
-  } else {
-    userContent = `
-Write a high-quality plain text in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
-Topic: ${topic || 'generic'}; Keywords: ${keywords || 'none'}.
-Varied vocabulary, coherent structure, no boilerplate or repetition.
-Return plain text only. Target ≈ ${words} words (±10%).
-`.trim();
+async function generateSecondaryKeywords({ language='pt', targetCountry='Brasil', topic='', primaryKeyword='', min=8, aiModel }) {
+  // tenta IA
+  if (openaiClient) {
+    const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    const resp = await openaiClient.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: 'Return only a comma-separated list of SEO secondary keywords. No numbering. No extra text.' },
+        { role: 'user', content:
+`Language: ${langName(language)}; Country target: ${targetCountry}.
+Topic: ${topic || '(none)'}
+Primary keyword: ${primaryKeyword || '(none)'}
+Return at least ${min} related SEO secondary keywords, comma-separated.` }
+      ],
+      max_tokens: 300,
+      temperature: 0.7,
+    });
+    const text = resp?.choices?.[0]?.message?.content || '';
+    const arr = ensureArrayFromCsv(text);
+    if (arr.length >= min) return arr.slice(0, Math.max(min, arr.length));
   }
-
-  const resp = await openaiClient.chat.completions.create({
-    model,
-    messages: [
-      { role: 'system', content: 'You are a careful writing assistant. Avoid repetition and boilerplate, follow the requested format strictly.' },
-      { role: 'user', content: userContent }
-    ],
-    max_tokens,
-    temperature: temp,
-    top_p: 0.9,
-    presence_penalty: 0.4,
-    frequency_penalty: 0.9,
-  });
-
-  const content = resp?.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error('Resposta vazia da IA');
-  return content;
+  // fallback local bobinho
+  const base = ensureArrayFromCsv(primaryKeyword).concat(
+    ensureArrayFromCsv(topic),
+    ['guia', 'dicas', 'estratégias', 'tendências', 'vantagens', 'como fazer', 'exemplos', 'melhores práticas', 'otimização', 'resultados']
+  ).filter(Boolean);
+  const out = [];
+  let i = 0;
+  while (out.length < min) out.push((base[i++] || `palavra-chave-extra-${i}`).toString());
+  return out;
 }
 
-/* ===================== rotas ===================== */
+async function gerarConteudoSEO({
+  language='pt', targetCountry='Brasil', words=800,
+  style='informativo', tone='casual', pov='first',
+  contentType='plain', topic='', primaryKeyword='', secondaryKeywords=[],
+  temperature=0.8, format='txt', aiModel
+}) {
+  const ln = langName(language);
+  const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
+  const minSec = 8;
+  const secList = Array.isArray(secondaryKeywords) ? secondaryKeywords : ensureArrayFromCsv(secondaryKeywords);
+  const finalSec = secList.length >= minSec ? secList : await generateSecondaryKeywords({ language, targetCountry, topic, primaryKeyword, min: minSec, aiModel });
+
+  // CSV (planilha): SecondaryKeyword, Paragraph
+  if (format === 'csv' || contentType === 'planilha') {
+    if (openaiClient) {
+      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+      const prompt = `
+Create SEO paragraphs for each secondary keyword below.
+Language: ${ln}; Country: ${targetCountry}; Style: ${style}; Tone: ${tone}; POV: ${pv}.
+Primary keyword: ${primaryKeyword || '(none)'}
+Rules:
+- One paragraph per secondary keyword, optimized for SEO.
+- Start the paragraph with the keyword itself.
+- Natural density (no stuffing), varied vocabulary, no repetition.
+- Keep a balanced length overall (target ≈ ${words} words total).
+Return ONLY CSV with header: SecondaryKeyword,Paragraph. No code fences.
+Secondary keywords:
+${finalSec.map(k => `- ${k}`).join('\n')}
+`.trim();
+
+      const r = await openaiClient.chat.completions.create({
+        model, max_tokens: wordsToTokens(words) + 200, temperature,
+        messages: [
+          { role: 'system', content: 'You output only CSV when asked for CSV.' },
+          { role: 'user', content: prompt }
+        ]
+      });
+      return extractCsvFromMarkdown(r?.choices?.[0]?.message?.content || '');
+    }
+    // fallback local
+    const rows = [['SecondaryKeyword','Paragraph']];
+    for (const k of finalSec) rows.push([k, `${k} — Parágrafo otimizado para SEO, linguagem natural, sem repetição, cobrindo nuances relevantes.`]);
+    return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+  }
+
+  // MD / TXT / PDF: introdução + um parágrafo por secundária
+  if (openaiClient) {
+    const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    const isMD = format === 'md' || contentType === 'blog';
+    const prompt = `
+Write SEO-optimized content in ${ln} for ${targetCountry}.
+Style: ${style}; Tone: ${tone}; POV: ${pv}.
+Primary keyword: ${primaryKeyword || '(none)'}
+Topic: ${topic || '(none)'}
+Secondary keywords (use AT LEAST these, one paragraph EACH, starting with the keyword):
+${finalSec.map(k => `- ${k}`).join('\n')}
+
+Rules:
+- Start with a short introduction that naturally includes the primary keyword in the first 100 words.
+- Then, create EXACTLY one paragraph per secondary keyword, and each paragraph MUST START with that keyword.
+- Avoid repetition, keep vocabulary varied, and ensure coherence.
+- Optimize headings/structure if Markdown; otherwise just paragraphs separated by blank lines.
+- Target ≈ ${words} words overall (±10%).
+- Return ONLY ${isMD ? 'Markdown' : 'plain text'} (no code fences).
+`.trim();
+
+    const r = await openaiClient.chat.completions.create({
+      model,
+      max_tokens: wordsToTokens(words) + 256,
+      temperature,
+      top_p: 0.9,
+      presence_penalty: 0.4,
+      frequency_penalty: 0.9,
+      messages: [
+        { role: 'system', content: 'You generate coherent SEO content. Avoid repetition and boilerplate. Follow the structural rules strictly.' },
+        { role: 'user', content: prompt }
+      ]
+    });
+    return r?.choices?.[0]?.message?.content?.trim() || '';
+  }
+
+  // fallback local
+  const intro = `Introdução — conteúdo SEO em ${ln}, alvo ${targetCountry}, estilo ${style}, tom ${tone}, ${pv}. `
+    + (primaryKeyword ? `Palavra-chave principal: ${primaryKeyword}. ` : '')
+    + (topic ? `Tema: ${topic}. ` : '');
+  const paras = finalSec.map(k => `${k} — Parágrafo otimizado para SEO em linguagem natural, sem repetição, trazendo variações e contexto relevante.`);
+  return [intro, ...paras].join('\n\n');
+}
+
+/* =============== rotas =============== */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime(), ai: !!openaiClient });
 });
@@ -225,27 +236,20 @@ app.post('/api/generate', async (req, res, next) => {
       contentType='plain',
       format='txt',
       filename,
-      topic='', keywords='', temperature=0.8,
+      topic='', primaryKeyword='', secondaryKeywords='',
+      temperature=0.8,
       aiModel
     } = req.body || {};
 
-    // gerar conteúdo (IA se disponível; fallback local)
-    let content;
-    try {
-      content = openaiClient
-        ? await gerarIA({ language, targetCountry, words, style, tone, pov, contentType, topic, keywords, temperature, format, aiModel })
-        : gerarLocal({ language, targetCountry, words, style, tone, pov, contentType, topic, keywords });
-    } catch (e) {
-      console.warn('IA falhou, usando local:', e?.message);
-      content = gerarLocal({ language, targetCountry, words, style, tone, pov, contentType, topic, keywords });
-    }
+    let content = await gerarConteudoSEO({
+      language, targetCountry, words, style, tone, pov,
+      contentType, topic, primaryKeyword, secondaryKeywords,
+      temperature, format, aiModel
+    });
 
     content = postProcess(content, format);
-
-    // nome seguro
     const safeName = String(filename || 'arquivo.txt').replace(/[^\w.\-]/g, '_');
 
-    // PDF (inline)
     if (format === 'pdf') {
       const chunks = [];
       const doc = new PDFDocument({ margin: 40 });
@@ -257,15 +261,13 @@ app.post('/api/generate', async (req, res, next) => {
         res.setHeader('Content-Disposition', `inline; filename="${safeName || 'arquivo.pdf'}"`);
         return res.status(200).send(pdfBuffer);
       });
-
-      doc.fontSize(16).text('Arquivo Gerado', { align: 'center' });
+      doc.fontSize(16).text('Arquivo Gerado (SEO)', { align: 'center' });
       doc.moveDown();
       doc.fontSize(12).text(content, { align: 'left' });
       doc.end();
       return;
     }
 
-    // Markdown
     if (format === 'md') {
       const cleaned = String(content).replace(/```(?:markdown)?\s*|\s*```/gi, '');
       const buf = Buffer.from(cleaned, 'utf-8');
@@ -274,8 +276,7 @@ app.post('/api/generate', async (req, res, next) => {
       return res.status(200).send(buf);
     }
 
-    // CSV (BOM + CRLF, sem cercas)
-    if (format === 'csv') {
+    if (format === 'csv' || contentType === 'planilha') {
       const cleaned = extractCsvFromMarkdown(content);
       const buf = toCsvUtf8Bom(cleaned);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -283,7 +284,6 @@ app.post('/api/generate', async (req, res, next) => {
       return res.status(200).send(buf);
     }
 
-    // TXT
     const buffer = Buffer.from(content, 'utf-8');
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'arquivo.txt'}"`);
