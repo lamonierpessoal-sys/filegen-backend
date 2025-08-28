@@ -1,4 +1,4 @@
-// server.cjs — Express + IA (OpenAI) + Blog SEO estruturado (H1/H2/H3, bold, Dicas, FAQ) + 8+ keywords + fallback local
+// server.cjs — Express + IA (OpenAI) + Blog SEO estruturado + 8+ keywords + CORS robusto + FALLBACK local
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -9,14 +9,25 @@ const PDFDocument = require('pdfkit');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* =============== CORS =============== */
+/* ================= CORS ROBUSTO ================= */
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
+const okSuffixes = ['.repl.co', '.replit.app', '.replit.dev', '.worf.replit.dev'];
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (!allowed.length) res.setHeader('Access-Control-Allow-Origin', '*');
-  else if (origin && allowed.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin) console.log('CORS Origin recebida:', origin);
+
+  if (!allowed.length) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  } else {
+    try {
+      const host = new URL(origin || '', 'http://x').hostname;
+      const okExact = origin && allowed.includes(origin);
+      const okSuf = host && okSuffixes.some(s => host.endsWith(s));
+      if (okExact || okSuf) res.setHeader('Access-Control-Allow-Origin', origin);
+    } catch {}
+  }
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -28,20 +39,26 @@ app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     if (!allowed.length) return cb(null, true);
-    return cb(null, allowed.includes(origin));
+    try {
+      const host = new URL(origin).hostname;
+      if (allowed.includes(origin) || okSuffixes.some(s => host.endsWith(s))) {
+        return cb(null, true);
+      }
+    } catch {}
+    return cb(null, false); // não gera 500
   },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   optionsSuccessStatus: 204,
 }));
 
-/* =============== middlewares =============== */
+/* ================= middlewares ================= */
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-/* =============== helpers =============== */
+/* ================= helpers ================= */
 function wordsToTokens(n) { return Math.max(64, Math.ceil(Number(n || 800) * 1.4)); }
 function extractCsvFromMarkdown(s) {
   if (!s) return '';
@@ -81,13 +98,10 @@ function langName(code) {
   return map[code] || 'Portuguese';
 }
 function ensureArrayFromCsv(s) {
-  return String(s || '')
-    .split(',')
-    .map(x => x.trim())
-    .filter(Boolean);
+  return String(s || '').split(',').map(x => x.trim()).filter(Boolean);
 }
 
-/* =============== IA opcional =============== */
+/* ================= IA opcional ================= */
 const useAI = !!process.env.OPENAI_API_KEY;
 let openaiClient = null;
 if (useAI) {
@@ -100,11 +114,11 @@ if (useAI) {
   }
 }
 
-/* =============== SEO: keywords secundárias =============== */
+/* ================= SEO: secundárias ================= */
 function localSecondaryKeywords({ primaryKeyword, topic, min=8 }) {
   const base = ensureArrayFromCsv(primaryKeyword).concat(
     ensureArrayFromCsv(topic),
-    ['apresentação', 'benefícios', 'estratégias', 'práticas recomendadas', 'otimização', 'tendências', 'métricas', 'exemplos']
+    ['apresentação','benefícios','estratégias','práticas recomendadas','otimização','tendências','métricas','exemplos']
   ).filter(Boolean);
   const out = [];
   let i = 0;
@@ -115,8 +129,16 @@ function localSecondaryKeywords({ primaryKeyword, topic, min=8 }) {
 async function generateSecondaryKeywords({ language='pt', targetCountry='Brasil', topic='', primaryKeyword='', min=8, aiModel }) {
   if (openaiClient) {
     try {
-      // modelos conforme UI
-      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+      // mapeia os nomes da UI para modelos válidos
+      const selected = (aiModel || '').toLowerCase();
+      const map = {
+        'gpt-4o': 'gpt-4o',
+        'gpt-4o-mini': 'gpt-4o-mini',
+        'gpt-4-turbo': 'gpt-4.1-mini',  // proxy leve
+        'gpt-3.5-turbo': 'gpt-4o-mini'  // proxy leve
+      };
+      const model = map[selected] || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
       const resp = await openaiClient.chat.completions.create({
         model,
         messages: [
@@ -140,7 +162,7 @@ Return at least ${min} related SEO secondary keywords, comma-separated.` }
   return localSecondaryKeywords({ primaryKeyword, topic, min });
 }
 
-/* =============== geração de conteúdo =============== */
+/* ================= geração de conteúdo ================= */
 function localBlogMarkdown({
   language='pt', targetCountry='Brasil', style='informativo', tone='casual', pov='first',
   topic='', primaryKeyword='', secondaryList=[], words=800
@@ -154,14 +176,14 @@ function localBlogMarkdown({
     '### Contexto',
     'Texto introdutório com **termos importantes** e ligação ao problema do leitor.',
     '### Benefícios',
-    'Lista de vantagens e valor para o público-alvo com **ganhos concretos**.',
+    'Vantagens e valor para o público-alvo com **ganhos concretos**.',
     '## Como Fazer (Passo a Passo)',
     '### Passo 1',
     'Instruções claras, com **palavras-chave** relacionadas de forma natural.',
     '### Passo 2',
     'Mais instruções com foco em **resultado** e **clareza**.',
     '## Erros Comuns',
-    '**Evite** armadilhas e explique o porquê, sempre com alternativas.'
+    '**Evite** armadilhas, explique o porquê e ofereça alternativas.'
   ].join('\n\n');
 
   const secaoKeywords = [
@@ -174,7 +196,7 @@ function localBlogMarkdown({
     '- **Estruture** o conteúdo com subtítulos descritivos.',
     '- **Varie** o vocabulário e evite repetição.',
     '- **Inclua** exemplos e casos práticos.',
-    '- **Use** ligações internas e externas relevantes.',
+    '- **Use** links internos e externos relevantes.',
   ].join('\n');
 
   const faq = [
@@ -207,22 +229,30 @@ async function gerarConteudo({
     ? secListIn
     : await generateSecondaryKeywords({ language, targetCountry, topic, primaryKeyword, min: minSec, aiModel });
 
-  // CSV: SecondaryKeyword,Paragraph
+  // CSV (planilha)
   if (format === 'csv' || contentType === 'planilha') {
-    // IA -> CSV
     if (openaiClient) {
       try {
-        const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+        const selected = (aiModel || '').toLowerCase();
+        const map = {
+          'gpt-4o': 'gpt-4o',
+          'gpt-4o-mini': 'gpt-4o-mini',
+          'gpt-4-turbo': 'gpt-4.1-mini',
+          'gpt-3.5-turbo': 'gpt-4o-mini'
+        };
+        const model = map[selected] || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
         const prompt = `
 Create SEO paragraphs for each secondary keyword below.
-- One paragraph per secondary keyword, and each paragraph MUST START with the keyword in **bold**.
-- Use natural density (no stuffing), varied vocabulary, no repetition.
-- Balanced length (target ≈ ${words} words total).
+- One paragraph per secondary keyword, MUST START with the keyword in **bold**.
+- Natural density, varied vocabulary, no repetition.
+- Target ≈ ${words} words total.
 Return ONLY CSV with header: SecondaryKeyword,Paragraph (no code fences).
 
 Secondary keywords:
 ${finalSec.map(k => `- ${k}`).join('\n')}
 `.trim();
+
         const r = await openaiClient.chat.completions.create({
           model, max_tokens: wordsToTokens(words) + 200, temperature,
           messages: [
@@ -233,16 +263,24 @@ ${finalSec.map(k => `- ${k}`).join('\n')}
         return extractCsvFromMarkdown(r?.choices?.[0]?.message?.content || '');
       } catch (e) { console.warn('IA (CSV) falhou:', e?.message); }
     }
-    // Fallback CSV local
+    // fallback CSV local
     const rows = [['SecondaryKeyword','Paragraph']];
     for (const k of finalSec) rows.push([k, `**${k}** — Parágrafo otimizado para SEO, natural e sem repetição.`]);
     return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
   }
 
-  // Blog/MD/TXT/PDF
+  // Blog/MD/TXT/PDF via IA
   if (openaiClient && (contentType === 'blog' || format === 'md' || format === 'pdf' || format === 'txt')) {
     try {
-      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+      const selected = (aiModel || '').toLowerCase();
+      const map = {
+        'gpt-4o': 'gpt-4o',
+        'gpt-4o-mini': 'gpt-4o-mini',
+        'gpt-4-turbo': 'gpt-4.1-mini',
+        'gpt-3.5-turbo': 'gpt-4o-mini'
+      };
+      const model = map[selected] || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
       const ln = langName(language);
       const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
       const isMD = format === 'md' || contentType === 'blog';
@@ -251,20 +289,19 @@ ${finalSec.map(k => `- ${k}`).join('\n')}
 Write a **blog post** in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
 Structure strictly as Markdown with:
 - H1 title including the primary keyword
-- H2/H3 hierarchy (Overview/Context/Benefits, How-To with steps, Common Mistakes)
-- A section "Palavras-chave Secundárias" where EACH paragraph starts with the secondary keyword in **bold**
+- H2/H3 hierarchy (Overview/Context/Benefits, How-To steps, Common Mistakes)
+- A section "Palavras-chave Secundárias": EACH paragraph starts with the secondary keyword in **bold**
 - A section "Dicas" (bulleted list) with bolded important terms
 - A section "FAQ" with 4–6 Q&As (H3 questions), concise answers
 - Conclusion with CTA
 Rules:
-- Use **bold** for important terms naturally
-- Avoid repetition/boilerplate, varied vocabulary
+- Use **bold** for important terms naturally; avoid repetition; varied vocabulary
 - Target ≈ ${words} words (±10%)
 - Return ONLY Markdown (no code fences)
 
 Primary keyword: ${primaryKeyword || '(none)'}
 Topic: ${topic || '(none)'}
-Secondary keywords (MIN 8, one paragraph EACH in the secondary section):
+Secondary keywords (MIN 8, one paragraph EACH):
 ${finalSec.map(k => `- ${k}`).join('\n')}
 `.trim();
 
@@ -292,7 +329,7 @@ ${finalSec.map(k => `- ${k}`).join('\n')}
   });
 }
 
-/* =============== rotas =============== */
+/* ================= rotas ================= */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime(), ai: !!openaiClient });
 });
@@ -302,12 +339,9 @@ app.post('/api/generate', async (req, res, next) => {
     const {
       language='pt', targetCountry='Brasil', words=800,
       style='informativo', tone='casual', pov='first',
-      contentType='blog', // blog padrão
-      format='md',
-      filename,
-      topic='', primaryKeyword='', secondaryKeywords='',
-      temperature=0.8,
-      aiModel // gpt-4o | gpt-4o-mini | gpt-4-turbo | gpt-3.5-turbo
+      contentType='blog', format='md',
+      filename, topic='', primaryKeyword='', secondaryKeywords='',
+      temperature=0.8, aiModel
     } = req.body || {};
 
     let content = await gerarConteudo({
