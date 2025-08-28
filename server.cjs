@@ -1,4 +1,4 @@
-// server.cjs — Express + IA (OpenAI) + SEO avançado por parágrafo + PDF/MD/CSV/TXT
+// server.cjs — Express + IA (OpenAI) + SEO avançado + FALLBACK local sólido
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -102,36 +102,87 @@ if (useAI) {
   }
 }
 
-async function generateSecondaryKeywords({ language='pt', targetCountry='Brasil', topic='', primaryKeyword='', min=8, aiModel }) {
-  // tenta IA
-  if (openaiClient) {
-    const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
-    const resp = await openaiClient.chat.completions.create({
-      model,
-      messages: [
-        { role: 'system', content: 'Return only a comma-separated list of SEO secondary keywords. No numbering. No extra text.' },
-        { role: 'user', content:
-`Language: ${langName(language)}; Country target: ${targetCountry}.
-Topic: ${topic || '(none)'}
-Primary keyword: ${primaryKeyword || '(none)'}
-Return at least ${min} related SEO secondary keywords, comma-separated.` }
-      ],
-      max_tokens: 300,
-      temperature: 0.7,
-    });
-    const text = resp?.choices?.[0]?.message?.content || '';
-    const arr = ensureArrayFromCsv(text);
-    if (arr.length >= min) return arr.slice(0, Math.max(min, arr.length));
-  }
-  // fallback local bobinho
+/* =============== geração local (fallback) =============== */
+function localSecondaryKeywords({ primaryKeyword, topic, min=8 }) {
   const base = ensureArrayFromCsv(primaryKeyword).concat(
     ensureArrayFromCsv(topic),
-    ['guia', 'dicas', 'estratégias', 'tendências', 'vantagens', 'como fazer', 'exemplos', 'melhores práticas', 'otimização', 'resultados']
+    ['guia','dicas','estratégias','tendências','vantagens','como fazer','exemplos','melhores práticas','otimização','resultados']
   ).filter(Boolean);
   const out = [];
   let i = 0;
   while (out.length < min) out.push((base[i++] || `palavra-chave-extra-${i}`).toString());
   return out;
+}
+
+function localCsvFromKeywords(secList, words) {
+  const rows = [['SecondaryKeyword','Paragraph']];
+  for (const k of secList) {
+    rows.push([k, `${k} — Parágrafo otimizado para SEO, linguagem natural, sem repetição, cobrindo nuances relevantes.`]);
+  }
+  return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+}
+
+function localTextFromKeywords({
+  language='pt', targetCountry='Brasil', style='informativo', tone='casual', pov='first',
+  primaryKeyword='', topic='', secList=[], words=800, isMD=false
+}) {
+  const ln = langName(language);
+  const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
+  const intro = `Introdução — conteúdo SEO em ${ln}, alvo ${targetCountry}, estilo ${style}, tom ${tone}, ${pv}. `
+    + (primaryKeyword ? `Palavra-chave principal: ${primaryKeyword}. ` : '')
+    + (topic ? `Tema: ${topic}. ` : '');
+
+  const paras = secList.map(k => `${isMD ? '**'+k+'**' : k} — Parágrafo otimizado para SEO em linguagem natural, sem repetição, trazendo variações e contexto relevante.`);
+  const base = isMD
+    ? [
+        `# ${topic || primaryKeyword || 'Título (SEO)'}`,
+        primaryKeyword ? `> Meta: ${primaryKeyword}` : '',
+        '',
+        intro,
+        '',
+        ...paras
+      ].filter(Boolean).join('\n\n')
+    : [intro, ...paras].join('\n\n');
+
+  // aproxima a meta de palavras sem repetir frases
+  const tokens = base.split(/\s+/);
+  if (tokens.length >= words) return tokens.slice(0, words).join(' ');
+  const extras = ['Detalhamento adicional.', 'Exemplo prático.', 'Recomendações finais.', 'Observações úteis.'];
+  let i = 0;
+  while (tokens.length < words) tokens.push(extras[i++ % extras.length].replace(/\.$/, ''));
+  return tokens.slice(0, words).join(' ');
+}
+
+/* =============== geração com IA + fallback interno =============== */
+async function generateSecondaryKeywords({
+  language='pt', targetCountry='Brasil', topic='', primaryKeyword='', min=8, aiModel
+}) {
+  // Tenta IA primeiro
+  if (openaiClient) {
+    try {
+      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+      const resp = await openaiClient.chat.completions.create({
+        model,
+        messages: [
+          { role: 'system', content: 'Return only a comma-separated list of SEO secondary keywords. No numbering. No extra text.' },
+          { role: 'user', content:
+`Language: ${langName(language)}; Country target: ${targetCountry}.
+Topic: ${topic || '(none)'}
+Primary keyword: ${primaryKeyword || '(none)'}
+Return at least ${min} related SEO secondary keywords, comma-separated.` }
+        ],
+        max_tokens: 300,
+        temperature: 0.7,
+      });
+      const text = resp?.choices?.[0]?.message?.content || '';
+      const arr = ensureArrayFromCsv(text);
+      if (arr.length >= min) return arr.slice(0, Math.max(min, arr.length));
+    } catch (e) {
+      console.warn('IA (keywords) falhou:', e?.message);
+    }
+  }
+  // Fallback local
+  return localSecondaryKeywords({ primaryKeyword, topic, min });
 }
 
 async function gerarConteudoSEO({
@@ -143,14 +194,19 @@ async function gerarConteudoSEO({
   const ln = langName(language);
   const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
   const minSec = 8;
-  const secList = Array.isArray(secondaryKeywords) ? secondaryKeywords : ensureArrayFromCsv(secondaryKeywords);
-  const finalSec = secList.length >= minSec ? secList : await generateSecondaryKeywords({ language, targetCountry, topic, primaryKeyword, min: minSec, aiModel });
 
-  // CSV (planilha): SecondaryKeyword, Paragraph
+  // garante 8+ secundárias
+  const secListIn = Array.isArray(secondaryKeywords) ? secondaryKeywords : ensureArrayFromCsv(secondaryKeywords);
+  const finalSec = secListIn.length >= minSec
+    ? secListIn
+    : await generateSecondaryKeywords({ language, targetCountry, topic, primaryKeyword, min: minSec, aiModel });
+
+  // CSV (planilha)
   if (format === 'csv' || contentType === 'planilha') {
     if (openaiClient) {
-      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
-      const prompt = `
+      try {
+        const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+        const prompt = `
 Create SEO paragraphs for each secondary keyword below.
 Language: ${ln}; Country: ${targetCountry}; Style: ${style}; Tone: ${tone}; POV: ${pv}.
 Primary keyword: ${primaryKeyword || '(none)'}
@@ -158,32 +214,34 @@ Rules:
 - One paragraph per secondary keyword, optimized for SEO.
 - Start the paragraph with the keyword itself.
 - Natural density (no stuffing), varied vocabulary, no repetition.
-- Keep a balanced length overall (target ≈ ${words} words total).
+- Balanced length (target ≈ ${words} words total).
 Return ONLY CSV with header: SecondaryKeyword,Paragraph. No code fences.
 Secondary keywords:
 ${finalSec.map(k => `- ${k}`).join('\n')}
 `.trim();
 
-      const r = await openaiClient.chat.completions.create({
-        model, max_tokens: wordsToTokens(words) + 200, temperature,
-        messages: [
-          { role: 'system', content: 'You output only CSV when asked for CSV.' },
-          { role: 'user', content: prompt }
-        ]
-      });
-      return extractCsvFromMarkdown(r?.choices?.[0]?.message?.content || '');
+        const r = await openaiClient.chat.completions.create({
+          model, max_tokens: wordsToTokens(words) + 200, temperature,
+          messages: [
+            { role: 'system', content: 'You output only CSV when asked for CSV.' },
+            { role: 'user', content: prompt }
+          ]
+        });
+        return extractCsvFromMarkdown(r?.choices?.[0]?.message?.content || '');
+      } catch (e) {
+        console.warn('IA (CSV) falhou:', e?.message);
+      }
     }
-    // fallback local
-    const rows = [['SecondaryKeyword','Paragraph']];
-    for (const k of finalSec) rows.push([k, `${k} — Parágrafo otimizado para SEO, linguagem natural, sem repetição, cobrindo nuances relevantes.`]);
-    return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+    // Fallback local
+    return localCsvFromKeywords(finalSec, words);
   }
 
-  // MD / TXT / PDF: introdução + um parágrafo por secundária
+  // MD / TXT / PDF
+  const isMD = format === 'md' || contentType === 'blog';
   if (openaiClient) {
-    const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
-    const isMD = format === 'md' || contentType === 'blog';
-    const prompt = `
+    try {
+      const model = aiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+      const prompt = `
 Write SEO-optimized content in ${ln} for ${targetCountry}.
 Style: ${style}; Tone: ${tone}; POV: ${pv}.
 Primary keyword: ${primaryKeyword || '(none)'}
@@ -200,27 +258,30 @@ Rules:
 - Return ONLY ${isMD ? 'Markdown' : 'plain text'} (no code fences).
 `.trim();
 
-    const r = await openaiClient.chat.completions.create({
-      model,
-      max_tokens: wordsToTokens(words) + 256,
-      temperature,
-      top_p: 0.9,
-      presence_penalty: 0.4,
-      frequency_penalty: 0.9,
-      messages: [
-        { role: 'system', content: 'You generate coherent SEO content. Avoid repetition and boilerplate. Follow the structural rules strictly.' },
-        { role: 'user', content: prompt }
-      ]
-    });
-    return r?.choices?.[0]?.message?.content?.trim() || '';
+      const r = await openaiClient.chat.completions.create({
+        model,
+        max_tokens: wordsToTokens(words) + 256,
+        temperature,
+        top_p: 0.9,
+        presence_penalty: 0.4,
+        frequency_penalty: 0.9,
+        messages: [
+          { role: 'system', content: 'You generate coherent SEO content. Avoid repetition and boilerplate. Follow the structural rules strictly.' },
+          { role: 'user', content: prompt }
+        ]
+      });
+      const txt = r?.choices?.[0]?.message?.content?.trim() || '';
+      if (txt) return txt;
+    } catch (e) {
+      console.warn('IA (texto) falhou:', e?.message);
+    }
   }
 
-  // fallback local
-  const intro = `Introdução — conteúdo SEO em ${ln}, alvo ${targetCountry}, estilo ${style}, tom ${tone}, ${pv}. `
-    + (primaryKeyword ? `Palavra-chave principal: ${primaryKeyword}. ` : '')
-    + (topic ? `Tema: ${topic}. ` : '');
-  const paras = finalSec.map(k => `${k} — Parágrafo otimizado para SEO em linguagem natural, sem repetição, trazendo variações e contexto relevante.`);
-  return [intro, ...paras].join('\n\n');
+  // Fallback local
+  return localTextFromKeywords({
+    language, targetCountry, style, tone, pov,
+    primaryKeyword, topic, secList: finalSec, words, isMD
+  });
 }
 
 /* =============== rotas =============== */
@@ -241,6 +302,7 @@ app.post('/api/generate', async (req, res, next) => {
       aiModel
     } = req.body || {};
 
+    // Gera conteúdo com IA + fallback automático
     let content = await gerarConteudoSEO({
       language, targetCountry, words, style, tone, pov,
       contentType, topic, primaryKeyword, secondaryKeywords,
