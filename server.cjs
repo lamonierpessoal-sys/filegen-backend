@@ -164,8 +164,8 @@ Return at least ${min} related SEO secondary keywords, comma-separated.` }
 
 /* ================= geração de conteúdo ================= */
 function localBlogMarkdown({
-  language='pt', targetCountry='Brasil', style='informativo', tone='casual', pov='first',
-  topic='', primaryKeyword='', secondaryList=[], words=800
+  language='pt', targetCountry='Brasil', style='informativo', tone='professional', pov='first',
+  topic='', primaryKeyword='', secondaryList=[], words=1000
 }) {
   const H1 = `# ${topic || primaryKeyword || 'Título do Artigo (SEO)'}`;
   const meta = primaryKeyword ? `> **Palavra-chave principal:** ${primaryKeyword}` : '';
@@ -218,8 +218,8 @@ function localBlogMarkdown({
 }
 
 async function gerarConteudo({
-  language='pt', targetCountry='Brasil', words=800,
-  style='informativo', tone='casual', pov='first',
+  language='pt', targetCountry='Brasil', words=1000,
+  style='informativo', tone='professional', pov='first',
   contentType='blog', topic='', primaryKeyword='', secondaryKeywords=[],
   temperature=0.8, format='md', aiModel
 }) {
@@ -283,7 +283,6 @@ ${finalSec.map(k => `- ${k}`).join('\n')}
 
       const ln = langName(language);
       const pv = pov === 'first' ? 'first-person' : pov === 'second' ? 'second-person' : 'third-person';
-      const isMD = format === 'md' || contentType === 'blog';
 
       const prompt = `
 Write a **blog post** in ${ln} for ${targetCountry}, style ${style}, tone ${tone}, POV ${pv}.
@@ -337,8 +336,8 @@ app.get('/health', (_req, res) => {
 app.post('/api/generate', async (req, res, next) => {
   try {
     const {
-      language='pt', targetCountry='Brasil', words=800,
-      style='informativo', tone='casual', pov='first',
+      language='pt', targetCountry='Brasil', words=1000,          // <- 1000 por padrão
+      style='informativo', tone='professional', pov='first',      // <- profissional por padrão
       contentType='blog', format='md',
       filename, topic='', primaryKeyword='', secondaryKeywords='',
       temperature=0.8, aiModel
